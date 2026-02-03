@@ -10,7 +10,8 @@ from bs4 import BeautifulSoup
 from .base import BaseConnector, RawJob
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+    "Accept-Language": "en-SG,en;q=0.9",
 }
 
 def _clean(s: str) -> str:
@@ -30,10 +31,14 @@ class MyCareersFutureConnector(BaseConnector):
         slug = slugify(query)
         url = f"https://www.mycareersfuture.gov.sg/search/{slug}-jobs"
 
-        r = requests.get(url, headers=HEADERS, timeout=30)
-        r.raise_for_status()
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=30)
+            if r.status_code != 200:
+                return []
+        except Exception:
+            return []
 
-        soup = BeautifulSoup(r.text, "lxml")
+        soup = BeautifulSoup(r.text, "html.parser")
         jobs: List[RawJob] = []
 
         for a in soup.select("a[href*='/job/']"):
@@ -62,10 +67,10 @@ class MyCareersFutureConnector(BaseConnector):
     def _fetch_detail(self, job_url: str) -> RawJob:
         try:
             r = requests.get(job_url, headers=HEADERS, timeout=30)
-            r.raise_for_status()
+            if r.status_code != 200:
+                raise RuntimeError("Bad status")
 
-            soup = BeautifulSoup(r.text, "lxml")
-
+            soup = BeautifulSoup(r.text, "html.parser")
             title = ""
             h1 = soup.select_one("h1")
             if h1:
@@ -80,20 +85,19 @@ class MyCareersFutureConnector(BaseConnector):
 
             text = soup.get_text("\n", strip=True)
 
-            # salary patterns
             m_sal = re.search(r"\$\s?\d[\d,]*\s*-\s*\$\s?\d[\d,]*", text)
             if m_sal:
                 salary = _clean(m_sal.group(0))
 
-            if re.search(r"\bFull[- ]?time\b", text, re.IGNORECASE):
+            if re.search(r"\bfull[- ]?time\b", text, re.IGNORECASE):
                 job_type = "Full-time"
-            elif re.search(r"\bPart[- ]?time\b", text, re.IGNORECASE):
+            elif re.search(r"\bpart[- ]?time\b", text, re.IGNORECASE):
                 job_type = "Part-time"
-            elif re.search(r"\bContract\b", text, re.IGNORECASE):
+            elif re.search(r"\bcontract\b", text, re.IGNORECASE):
                 job_type = "Contract"
 
             bullets = [_clean(li.get_text(" ", strip=True)) for li in soup.select("li")]
-            bullets = [b for b in bullets if 6 <= len(b) <= 80][:3]
+            bullets = [b for b in bullets if 6 <= len(b) <= 90][:3]
             if bullets:
                 reqs = "\n".join([f"• {b}" for b in bullets])
 
