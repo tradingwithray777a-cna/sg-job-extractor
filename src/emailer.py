@@ -1,28 +1,45 @@
+from __future__ import annotations
+
 import smtplib
+import ssl
 from email.message import EmailMessage
-import streamlit as st
+from pathlib import Path
 
-def send_email_with_attachment(recipient, subject, body_text, attachment_bytes, attachment_filename):
-    sender = st.secrets.get("SENDER_GMAIL")
-    app_pw = st.secrets.get("GMAIL_APP_PASSWORD")
 
-    if not sender or not app_pw:
-        raise ValueError("Missing email secrets. Set SENDER_GMAIL and GMAIL_APP_PASSWORD in Streamlit Secrets.")
+def send_gmail(
+    sender_gmail: str,
+    app_password: str,
+    recipient: str,
+    subject: str,
+    body: str,
+    attachment_path: str
+) -> None:
+    """
+    Sends an email using Gmail SMTP with an App Password and attaches an Excel file.
+    """
+    sender_gmail = (sender_gmail or "").strip()
+    app_password = (app_password or "").replace(" ", "").strip()
+    recipient = (recipient or "").strip()
+
+    if not sender_gmail or not app_password:
+        raise ValueError("Missing sender Gmail or app password.")
 
     msg = EmailMessage()
-    msg["From"] = sender
+    msg["From"] = sender_gmail
     msg["To"] = recipient
     msg["Subject"] = subject
-    msg.set_content(body_text)
+    msg.set_content(body)
 
+    p = Path(attachment_path)
+    data = p.read_bytes()
     msg.add_attachment(
-        attachment_bytes,
+        data,
         maintype="application",
         subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        filename=attachment_filename
+        filename=p.name
     )
 
-    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as smtp:
-        smtp.login(sender, app_pw)
-        smtp.send_message(msg)
-
+    context = ssl.create_default_context()
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=context) as server:
+        server.login(sender_gmail, app_password)
+        server.send_message(msg)
