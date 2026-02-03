@@ -1,10 +1,14 @@
-from io import BytesIO
-from openpyxl import Workbook
-from openpyxl.styles import Font, Alignment, PatternFill
+from __future__ import annotations
+
+from typing import List, Dict
+import pandas as pd
+from openpyxl import load_workbook
 from openpyxl.worksheet.table import Table, TableStyleInfo
+from openpyxl.styles import Font, PatternFill
 from openpyxl.utils import get_column_letter
 
-REQUIRED_COLS = [
+
+JOBS_COLS = [
     "Job title available",
     "employer",
     "job post url link",
@@ -18,49 +22,54 @@ REQUIRED_COLS = [
     "Closing date passed? (Y/N)",
 ]
 
-def build_excel_bytes(df_jobs, notes_dict):
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Jobs"
 
-    # Header
-    ws.append(REQUIRED_COLS)
-    header_fill = PatternFill("solid", fgColor="1F4E79")
-    header_font = Font(color="FFFFFF", bold=True)
+def write_excel(jobs: List[Dict], notes: Dict, out_path: str) -> str:
+    """
+    Writes:
+      - Sheet 1: Jobs (as an Excel table, filters, frozen header, hyperlink URLs)
+      - Sheet 2: Notes
+    Returns out_path.
+    """
+    # Build Jobs dataframe with exact column order
+    df = pd.DataFrame(jobs)
+    for c in JOBS_COLS:
+        if c not in df.columns:
+            df[c] = ""
+    df = df.reindex(columns=JOBS_COLS)
 
-    for c in ws[1]:
-        c.fill = header_fill
-        c.font = header_font
-        c.alignment = Alignment(vertical="center", wrap_text=True)
+    # Notes dataframe
+    df_notes = pd.DataFrame([{"Item": k, "Value": v} for k, v in (notes or {}).items()])
 
+    # Write initial workbook
+    with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+        df.to_excel(writer, sheet_name="Jobs", index=False)
+        df_notes.to_excel(writer, sheet_name="Notes", index=False)
+
+    wb = load_workbook(out_path)
+
+    # ---------------- Jobs sheet formatting ----------------
+    ws = wb["Jobs"]
     ws.freeze_panes = "A2"
 
-    # Rows
-    for _, row in df_jobs.iterrows():
-        ws.append([row.get(col, "") for col in REQUIRED_COLS])
+    # Header styling
+    header_fill = PatternFill("solid", fgColor="1F4E79")  # deep blue
+    header_font = Font(color="FFFFFF", bold=True)
+    for col in range(1, ws.max_column + 1):
+        cell = ws.cell(row=1, column=col)
+        cell.fill = header_fill
+        cell.font = header_font
 
-    # Hyperlinks in URL col (C)
-    for r in range(2, ws.max_row + 1):
-        cell = ws.cell(row=r, column=3)
-        url = cell.value
-        if isinstance(url, str) and url.startswith("http"):
-            cell.hyperlink = url
-            cell.style = "Hyperlink"
+    # Hyperlinks on URL column (3rd column)
+    for row in range(2, ws.max_row + 1):
+        cell = ws.cell(row=row, column=3)
+        if isinstance(cell.value, str) and cell.value.startswith("http"):
+            cell.hyperlink = cell.value
+            cell.font = Font(color="0000EE", underline="single")
 
-    # Column widths
-    widths = {1:42,2:28,3:58,4:18,5:18,6:20,7:48,8:18,9:18,10:14,11:18}
-    for col_idx, w in widths.items():
-        ws.column_dimensions[get_column_letter(col_idx)].width = w
-
-    # Wrap text on selected cols
-    wrap_cols = {1,2,7,8,9}
-    for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
-        for cell in row:
-            cell.alignment = Alignment(vertical="top", wrap_text=(cell.column in wrap_cols))
-
-    # Add Excel table
-    table_ref = f"A1:{get_column_letter(len(REQUIRED_COLS))}{ws.max_row}"
-    tab = Table(displayName="JobsTable", ref=table_ref)
+    # Add Excel table (filters are included)
+    end_col = get_column_letter(ws.max_column)
+    end_row = ws.max_row
+    tab = Table(displayName="JobsTable", ref=f"A1:{end_col}{end_row}")
     tab.tableStyleInfo = TableStyleInfo(
         name="TableStyleMedium9",
         showRowStripes=True,
@@ -68,20 +77,22 @@ def build_excel_bytes(df_jobs, notes_dict):
     )
     ws.add_table(tab)
 
-    # Notes sheet
-    ws2 = wb.create_sheet("Notes")
-    ws2.append(["Item", "Value"])
-    ws2["A1"].font = Font(bold=True)
-    ws2["B1"].font = Font(bold=True)
+    # Auto column width (simple heuristic, first 200 rows)
+    for col in range(1, ws.max_column + 1):
+        max_len = 10
+        for r in range(1, min(ws.max_row, 200) + 1):
+            v = ws.cell(row=r, column=col).value
+            if v is None:
+                continue
+            max_len = max(max_len, len(str(v)))
+        ws.column_dimensions[get_column_letter(col)].width = min(60, max_len + 2)
+
+    # ---------------- Notes sheet formatting ----------------
+    ws2 = wb["Notes"]
     ws2.freeze_panes = "A2"
-    ws2.column_dimensions["A"].width = 40
+    ws2.column_dimensions["A"].width = 38
     ws2.column_dimensions["B"].width = 120
 
-    for k, v in notes_dict.items():
-        ws2.append([k, v])
-
-    bio = BytesIO()
-    wb.save(bio)
-    bio.seek(0)
-    return bio.read()
-
+    # Save
+    wb.save(out_path)
+    return out_path
