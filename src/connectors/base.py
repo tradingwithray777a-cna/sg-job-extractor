@@ -1,13 +1,23 @@
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import List
+
+
+@dataclass
+class RawJob:
+    title: str
+    employer: str
+    url: str
+    source: str
+    posted_date: str  # YYYY-MM-DD or "Unverified"
+    closing_date: str  # YYYY-MM-DD or "Not stated"
+    requirements: str  # 1–3 bullet-ish phrases
+    salary: str  # or "Not stated"
+    job_type: str  # Full-time / Part-time / Contract / Not stated
+
+
 class BaseConnector:
-    name = "Base"
+    source_name: str = "Base"
 
-    def search(self, query: str, posted_within_days: int = 30):
-        """
-        Return a list of dict rows matching REQUIRED_COLS (some may be Unverified).
-        Each row should contain:
-          Job title available, employer, job post url link, job post from what source,
-          date job post was posted, application closing date, key job requirement,
-          estimated salary, job full-time or part-time
-        """
+    def search(self, query: str, limit: int = 80) -> List[RawJob]:
         raise NotImplementedError
-
