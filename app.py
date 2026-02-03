@@ -1,5 +1,5 @@
 import streamlit as st
-from src.runner import run_job_search
+from src.runner import run_search
 from src.excel_writer import build_excel_bytes
 from src.emailer import send_email_with_attachment
 
@@ -81,14 +81,18 @@ if run_btn:
             st.stop()
 
     with st.spinner("Running extraction, scoring, dedupe & Excel generation..."):
-        result = run_job_search(
+        
+        out_path = run_search(
             target_role=TARGET_ROLE.strip(),
             posted_within_days=int(days),
             selected_portals=selected_portals,
             max_final=int(max_results),
-            prefer_fulltime=prefer_fulltime,
+            raw_cap=200,
+            out_path="output.xlsx",
         )
 
+
+        
         df_jobs = result["jobs_df"]
         notes = result["notes_dict"]
 
