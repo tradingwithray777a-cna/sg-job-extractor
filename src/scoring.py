@@ -1,117 +1,142 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime, date
-from typing import Dict, List, Optional
+from typing import List
+from urllib.parse import quote_plus, urljoin
 
+import requests
+from bs4 import BeautifulSoup
 
-def _norm(s: str) -> str:
-    s = (s or "").strip().lower()
-    s = re.sub(r"\s+", " ", s)
-    return s
+from .base import BaseConnector, RawJob
 
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+    "Accept-Language": "en-SG,en;q=0.9",
+}
 
-def _contains_all_words(title: str, target: str) -> bool:
-    t_words = [w for w in _norm(target).split(" ") if w]
-    tt = _norm(title)
-    return all(w in tt for w in t_words)
+def _clean(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip())
 
-
-def title_score(job_title: str, target_role: str, adjacent_titles: List[str], nearby_titles: List[str]) -> int:
-    jt = _norm(job_title)
-    tr = _norm(target_role)
-
-    # Exact phrase
-    if tr and tr in jt:
-        return 120
-
-    # Contains all main words (any order)
-    if _contains_all_words(job_title, target_role):
-        return 100
-
-    # Adjacent title strong match
-    adj_norm = [_norm(x) for x in (adjacent_titles or [])]
-    if any(a and a in jt for a in adj_norm):
-        return 85
-
-    # Nearby functional title match
-    nb_norm = [_norm(x) for x in (nearby_titles or [])]
-    if any(n and n in jt for n in nb_norm):
-        return 60
-
-    # Partial match
-    tr_words = [w for w in tr.split(" ") if w]
-    if any(w in jt for w in tr_words):
-        return 30
-
-    return 0
-
-
-def domain_score(employer: str) -> int:
-    """
-    Generic heuristic for employer/sector.
-    Safe default: tries to infer some sectors using name keywords.
-    """
-    e = _norm(employer)
-    if not e:
-        return 10
-
-    strong = [
-        "government", "ministry", "statutory", "agency",
-        "hospital", "clinic", "health",
-        "university", "polytechnic", "school",
-        "foundation", "charity", "ngo",
-        "engineering", "construction", "consultancy",
-        "hotel"
+def _looks_like_ui(text: str) -> bool:
+    t = (text or "").strip().lower()
+    bad = [
+        "what’s your preferred work location",
+        "what's your preferred work location",
+        "filter",
+        "sort",
+        "job alerts",
+        "sign in",
+        "login",
     ]
-    partial = ["pte", "ltd", "llp", "group", "holding", "services", "service"]
+    return (len(t) < 4) or any(b in t for b in bad)
 
-    if any(k in e for k in strong):
-        return 40
-    if any(k in e for k in partial):
-        return 25
-    return 10
+class FastJobsConnector(BaseConnector):
+    source_name = "FastJobs"
 
+    def search(self, query: str, limit: int = 80) -> List[RawJob]:
+        # FastJobs search (keyword)
+        # This URL pattern works commonly; if FastJobs changes it, we’ll adjust.
+        q = quote_plus(query.strip())
+        url = f"https://www.fastjobs.sg/singapore-jobs/en/search-jobs/{q}/"
 
-def employment_score(job_type: str) -> int:
-    jt = _norm(job_type)
-    if "full" in jt:
-        return 20
-    if "contract" in jt or "temp" in jt:
-        return 15
-    if "part" in jt:
-        return 5
-    return 0
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=30)
+            if r.status_code != 200:
+                return []
+        except Exception:
+            return []
 
+        soup = BeautifulSoup(r.text, "html.parser")
+        jobs: List[RawJob] = []
 
-def compute_relevance(row: Dict, target_role: str, adjacent_titles: List[str], nearby_titles: List[str]) -> int:
-    """
-    Final relevance score 0–200:
-      A) Title match max 140
-      B) Domain match max 40
-      C) Employment type max 20
-    """
-    a = title_score(row.get("Job title available", ""), target_role, adjacent_titles, nearby_titles)
-    b = domain_score(row.get("employer", ""))
-    c = employment_score(row.get("job full-time or part-time", ""))
+        # job ad links usually contain /singapore-job-ad/
+        for a in soup.select("a[href*='/singapore-job-ad/']"):
+            href = a.get("href") or ""
+            if not href:
+                continue
+            full = href if href.startswith("http") else urljoin("https://www.fastjobs.sg", href)
 
-    return min(200, a + b + c)
+            title = _clean(a.get_text(" ", strip=True))
+            if _looks_like_ui(title):
+                continue
 
+            if any(j.url == full for j in jobs):
+                continue
 
-def closing_passed(closing_date: str, today: Optional[date] = None) -> str:
-    """
-    Return: Yes / No / Unknown
-    closing_date expected YYYY-MM-DD or "Not stated"
-    """
-    if today is None:
-        today = datetime.now().date()
+            det = self._fetch_detail(full)
+            if not det.title:
+                det.title = title
 
-    cd = (closing_date or "").strip()
-    if cd in ("", "Not stated"):
-        return "Unknown"
+            # one more UI sanity check
+            if _looks_like_ui(det.title):
+                continue
 
-    try:
-        d = datetime.strptime(cd, "%Y-%m-%d").date()
-        return "Yes" if d < today else "No"
-    except Exception:
-        return "Unknown"
+            jobs.append(det)
+            if len(jobs) >= limit:
+                break
+
+        return jobs
+
+    def _fetch_detail(self, job_url: str) -> RawJob:
+        try:
+            r = requests.get(job_url, headers=HEADERS, timeout=30)
+            if r.status_code != 200:
+                raise RuntimeError("Bad status")
+
+            soup = BeautifulSoup(r.text, "html.parser")
+            title = ""
+            h1 = soup.select_one("h1")
+            if h1:
+                title = _clean(h1.get_text(" ", strip=True))[:200]
+
+            text = soup.get_text("\n", strip=True)
+
+            employer = "Not stated"
+            salary = "Not stated"
+            job_type = "Not stated"
+            posted = "Unverified"
+            closing = "Not stated"
+            reqs = "• Not stated"
+
+            # requirements: first 3 meaningful li items
+            bullets = [_clean(li.get_text(" ", strip=True)) for li in soup.select("li")]
+            bullets = [b for b in bullets if 6 <= len(b) <= 90][:3]
+            if bullets:
+                reqs = "\n".join([f"• {b}" for b in bullets])
+
+            # job type detection
+            if re.search(r"\bfull[- ]?time\b", text, re.IGNORECASE):
+                job_type = "Full-time"
+            elif re.search(r"\bpart[- ]?time\b", text, re.IGNORECASE):
+                job_type = "Part-time"
+            elif re.search(r"\bcontract\b", text, re.IGNORECASE):
+                job_type = "Contract"
+
+            # salary (basic heuristic)
+            m_sal = re.search(r"S\$\s*[\d,]+(\s*-\s*[\d,]+)?", text, re.IGNORECASE)
+            if m_sal:
+                salary = _clean(m_sal.group(0))
+
+            return RawJob(
+                title=title,
+                employer=employer,
+                url=job_url,
+                source=self.source_name,
+                posted_date=posted,
+                closing_date=closing,
+                requirements=reqs,
+                salary=salary,
+                job_type=job_type,
+            )
+        except Exception:
+            return RawJob(
+                title="",
+                employer="Not stated",
+                url=job_url,
+                source=self.source_name,
+                posted_date="Unverified",
+                closing_date="Not stated",
+                requirements="• Not stated",
+                salary="Not stated",
+                job_type="Not stated",
+            )
