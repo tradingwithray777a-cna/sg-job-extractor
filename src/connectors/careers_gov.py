@@ -1,10 +1,9 @@
 from .base import BaseConnector
 
-class MyCareersFutureConnector(BaseConnector):
-    name = "MyCareersFuture"
+class CareersGovConnector(BaseConnector):
+    name = "Careers.gov.sg"
 
     def search(self, query: str, posted_within_days: int = 30):
-        # MCF often requires JS rendering and may block bots.
-        # For MVP, return empty and let Notes explain access constraints.
+        # TODO: implement. Start simple with a small number of results.
         return []
 
