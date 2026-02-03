@@ -1,161 +1,172 @@
-import pandas as pd
-from datetime import datetime, timedelta, timezone, date
+from __future__ import annotations
+
+from datetime import datetime
+from typing import Dict, List, Tuple
+import re
+
 from src.keywords import build_keyword_sets
-from src.scoring import relevance_score
+from src.scoring import compute_relevance, closing_passed
+from src.excel_writer import write_excel
 
 from src.connectors.mycareersfuture import MyCareersFutureConnector
-from src.connectors.careers_gov import CareersGovConnector
-from src.connectors.fastjobs import FastJobsConnector
 from src.connectors.grabjobs import GrabJobsConnector
 from src.connectors.foundit import FounditConnector
-from src.connectors.jobstreet import JobStreetConnector
-from src.connectors.indeed import IndeedConnector
-from src.connectors.glassdoor import GlassdoorConnector
-from src.connectors.linkedin import LinkedInConnector
+from src.connectors.fastjobs import FastJobsConnector
 
-SG_TZ = timezone(timedelta(hours=8))
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
 
-REQUIRED_COLS = [
-    "Job title available","employer","job post url link","job post from what source",
-    "date job post was posted","application closing date","key job requirement",
-    "estimated salary","job full-time or part-time","Relevance score","Closing date passed? (Y/N)"
-]
+CONNECTORS = {
+    "MyCareersFuture": MyCareersFutureConnector(),
+    "GrabJobs": GrabJobsConnector(),
+    "Foundit": FounditConnector(),
+    "FastJobs": FastJobsConnector(),
+}
 
-def closing_passed(closing):
-    if isinstance(closing, date):
-        return "Yes" if closing < datetime.now(SG_TZ).date() else "No"
-    if isinstance(closing, str):
-        try:
-            cd = datetime.fromisoformat(closing).date()
-            return "Yes" if cd < datetime.now(SG_TZ).date() else "No"
-        except Exception:
-            return "Unknown"
-    return "Unknown"
+def build_queries(target_role: str, adjacent_titles: List[str], core_keywords: List[str]) -> List[Tuple[str, str]]:
+    """
+    Must have 3 variations per portal:
+    - Exact
+    - Adjacent (pick 2–3)
+    - Skill-based (combine 2–3 core keywords)
+    """
+    queries: List[Tuple[str, str]] = []
+    queries.append((target_role, "Exact"))
 
-def run_job_search(target_role, posted_within_days, selected_portals, max_final=100, prefer_fulltime=True):
-    kw = build_keyword_sets(target_role)
-    core = kw["core_keywords"]
-    adjacent = kw["adjacent_titles"]
-    nearby = kw["nearby_titles"]
-    exclude = kw["exclude_keywords"]
+    for t in adjacent_titles[:3]:
+        queries.append((t, "Adjacent"))
 
-    # Map portal -> connector
-    connectors = {
-        "MyCareersFuture": MyCareersFutureConnector(),
-        "Careers.gov.sg": CareersGovConnector(),
-        "FastJobs": FastJobsConnector(),
-        "GrabJobs": GrabJobsConnector(),
-        "Foundit": FounditConnector(),
-        "JobStreet Singapore": JobStreetConnector(),
-        "Indeed Singapore": IndeedConnector(),
-        "Glassdoor Singapore": GlassdoorConnector(),
-        "LinkedIn Jobs": LinkedInConnector(),
-        # Others can be added later as connectors
-    }
+    # skill based: target + 2 core terms (excluding target itself)
+    cores = [c for c in core_keywords if _norm(c) != _norm(target_role)]
+    if len(cores) >= 2:
+        queries.append((f"{target_role} {cores[0]} {cores[1]}", "Skill-based"))
+    elif len(cores) == 1:
+        queries.append((f"{target_role} {cores[0]}", "Skill-based"))
+    else:
+        queries.append((target_role, "Skill-based"))
 
-    # Build query variations
-    exact = target_role
-    adj_picks = adjacent[:3] if adjacent else [target_role]
-    skill_based = f"{target_role} {core[0]} {core[1]}" if len(core) >= 2 else target_role
+    return queries[:5]
 
-    queries = [
-        ("Exact", exact),
-        ("Adjacent", adj_picks[0]),
-        ("Skill-based", skill_based),
-    ]
+def run_search(
+    target_role: str,
+    posted_within_days: int,
+    selected_portals: List[str],
+    max_final: int = 100,
+    raw_cap: int = 200,
+    out_path: str = "output.xlsx",
+) -> str:
+    ks = build_keyword_sets(target_role)
+    queries = build_queries(target_role, ks.adjacent_titles, ks.core_keywords)
 
-    raw_rows = []
-    portal_stats = {}
+    raw_rows: List[Dict] = []
+    portal_raw_counts: Dict[str, int] = {}
 
     for portal in selected_portals:
-        conn = connectors.get(portal)
+        conn = CONNECTORS.get(portal)
         if not conn:
-            portal_stats[portal] = "No connector yet (not extracted)"
+            portal_raw_counts[portal] = 0
             continue
 
-        portal_raw = []
-        portal_notes = []
-        for qtype, q in queries:
+        portal_hits = 0
+
+        # Enforce 3 query variations per portal
+        for q, qtype in queries[:3]:
             try:
-                items = conn.search(q, posted_within_days=posted_within_days)
-                portal_raw.extend(items)
-            except Exception as e:
-                portal_notes.append(f"{qtype} failed: {e}")
+                jobs = conn.search(q, limit=80)
+            except Exception:
+                jobs = []
 
-        portal_stats[portal] = f"raw={len(portal_raw)}; " + ("; ".join(portal_notes) if portal_notes else "ok")
+            portal_hits += len(jobs)
 
-        raw_rows.extend(portal_raw)
+            for j in jobs:
+                raw_rows.append({
+                    "Job title available": j.title or "Not stated",
+                    "employer": j.employer or "Not stated",
+                    "job post url link": j.url,
+                    "job post from what source": portal,
+                    "date job post was posted": j.posted_date or "Unverified",
+                    "application closing date": j.closing_date or "Not stated",
+                    "key job requirement": j.requirements or "• Not stated",
+                    "estimated salary": j.salary or "Not stated",
+                    "job full-time or part-time": j.job_type or "Not stated",
+                })
 
-    # Normalize to DataFrame
-    df = pd.DataFrame(raw_rows)
-    if df.empty:
-        df = pd.DataFrame(columns=REQUIRED_COLS)
+                if len(raw_rows) >= raw_cap:
+                    break
 
-    # Ensure required columns exist
-    for c in REQUIRED_COLS:
-        if c not in df.columns:
-            df[c] = ""
+            if len(raw_rows) >= raw_cap:
+                break
 
-    # Apply exclude keywords (title-based)
-    if exclude:
-        ex = [e.lower() for e in exclude]
-        df = df[~df["Job title available"].astype(str).str.lower().apply(lambda t: any(x in t for x in ex))]
+        portal_raw_counts[portal] = portal_hits
 
-    # Score
-    df["Relevance score"] = df.apply(
-        lambda r: relevance_score(target_role, r["Job title available"], r["employer"], r["job full-time or part-time"], adjacent, nearby),
-        axis=1
-    )
+        if len(raw_rows) >= raw_cap:
+            break
 
-    # Closing status
-    df["Closing date passed? (Y/N)"] = df["application closing date"].apply(closing_passed)
+    raw_count = len(raw_rows)
 
-    # Prefer full-time (ranking bias, not exclusion)
-    if prefer_fulltime:
-        ft_boost = df["job full-time or part-time"].astype(str).str.lower().str.contains("full").astype(int) * 3
-        df["Relevance score"] = (df["Relevance score"] + ft_boost).clip(upper=200)
+    # Filter: exclude keywords in title
+    filtered = []
+    excl = [_norm(x) for x in ks.exclude_keywords]
+    for r in raw_rows:
+        title_n = _norm(r["Job title available"])
+        if any(e and e in title_n for e in excl):
+            continue
+        filtered.append(r)
+
+    after_filter = len(filtered)
 
     # Deduplicate by (title + employer) keeping best completeness
-    def completeness_key(r):
-        posted = 1 if str(r["date job post was posted"]) not in ("Unverified", "", "None") else 0
-        closing = 1 if str(r["application closing date"]) not in ("Not stated", "", "None") else 0
-        salary = 1 if str(r["estimated salary"]) not in ("Not stated", "", "None") else 0
-        req_len = len(str(r["key job requirement"]).strip())
-        return (posted, closing, salary, req_len, r["Relevance score"])
+    def completeness_key(r: Dict):
+        verifiable_posted = 1 if r["date job post was posted"] not in ("Unverified", "", None) else 0
+        closing_present = 1 if r["application closing date"] not in ("Not stated", "", None) else 0
+        salary_present = 1 if r["estimated salary"] not in ("Not stated", "", None) else 0
+        req_len = len((r["key job requirement"] or "").strip())
+        return (verifiable_posted, closing_present, salary_present, req_len)
 
-    df["_ck"] = df.apply(completeness_key, axis=1)
-    df = df.sort_values(by=["_ck"], ascending=False).drop_duplicates(subset=["Job title available","employer"], keep="first").drop(columns=["_ck"])
+    best = {}
+    for r in filtered:
+        k = (_norm(r["Job title available"]), _norm(r["employer"]))
+        if k not in best:
+            best[k] = r
+        else:
+            if completeness_key(r) > completeness_key(best[k]):
+                best[k] = r
 
-    # Sorting logic: relevance desc, verifiable posted date newest, unverified bottom
-    def posted_sort_key(x):
-        if str(x) == "Unverified":
-            return (0, date(1900,1,1))
+    deduped = list(best.values())
+    after_dedupe = len(deduped)
+
+    # Score + closing passed
+    today = datetime.now().date()
+    for r in deduped:
+        r["Relevance score"] = compute_relevance(r, ks.target_role, ks.adjacent_titles, ks.nearby_titles)
+        r["Closing date passed? (Y/N)"] = closing_passed(r["application closing date"], today=today)
+
+    # Sorting logic:
+    # Relevance score desc
+    # Posted date verifiable newest first
+    # Unverified at bottom
+    def sort_key(r: Dict):
+        ver = 0 if r["date job post was posted"] == "Unverified" else 1
         try:
-            return (1, datetime.fromisoformat(str(x)).date())
+            d = datetime.strptime(r["date job post was posted"], "%Y-%m-%d").date()
         except Exception:
-            return (0, date(1900,1,1))
+            d = datetime(1970, 1, 1).date()
+        return (-int(r["Relevance score"]), -ver, -(d.toordinal()))
 
-    df["_pd"] = df["date job post was posted"].apply(posted_sort_key)
-    df = df.sort_values(by=["Relevance score","_pd"], ascending=[False, False]).drop(columns=["_pd"])
+    deduped.sort(key=sort_key)
 
-    # Cap to max_final
-    df = df.head(max_final)
+    final = deduped[:max_final]
+    final_count = len(final)
 
-    # Notes sheet content
     notes = {
-        "Search date/time (Singapore time)": datetime.now(SG_TZ).strftime("%Y-%m-%d %H:%M:%S SGT"),
-        "TARGET_ROLE": target_role,
-        "Core keywords used": ", ".join(core),
-        "Adjacent titles used": ", ".join(adjacent[:20]),
-        "Exclude keywords used": ", ".join(exclude),
-        "Portals selected": ", ".join(selected_portals),
-        "Portals searched + raw notes": " | ".join([f"{k}: {v}" for k,v in portal_stats.items()]),
-        "Counts: raw → after filter → after dedupe → final": f"{len(raw_rows)} → {len(raw_rows)} → {len(df)} → {len(df)}",
-        "Unverified posted date rule": "If posted date not available, set to 'Unverified'. Exclude >30 days only when posted date is verifiable; keep Unverified but rank lower.",
-        "MyCareersFuture note": "MCF pages may be JS-heavy and restrict automation. Connector will log inaccessible/limited extraction when blocked; we can add Playwright upgrade later.",
+        "Search date/time (SG time)": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "TARGET_ROLE": ks.target_role,
+        "Core keywords used": ", ".join(ks.core_keywords),
+        "Adjacent titles used": ", ".join(ks.adjacent_titles[:10]),
+        "Exclude keywords used": ", ".join(ks.exclude_keywords),
+        "Portals searched (raw hits)": "; ".join([f"{p}: {portal_raw_counts.get(p,0)}" for p in selected_portals]),
+        "Counts (raw → after filter → after dedupe → final)": f"{raw_count} → {after_filter} → {after_dedupe} → {final_count}",
+        "Unverified posted date rule": "If a portal does not show a posted date, set to 'Unverified'. Exclude >30 days only when date is verifiable. Unverified is ranked lower.",
     }
 
-    # Return in exact column order
-    df = df[REQUIRED_COLS].copy()
-    return {"jobs_df": df, "notes_dict": notes}
-
+    return write_excel(final, notes, out_path)
