@@ -10,7 +10,8 @@ from bs4 import BeautifulSoup
 from .base import BaseConnector, RawJob
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+    "Accept-Language": "en-SG,en;q=0.9",
 }
 
 def _clean(s: str) -> str:
@@ -21,14 +22,19 @@ class FastJobsConnector(BaseConnector):
     source_name = "FastJobs"
 
     def search(self, query: str, limit: int = 80) -> List[RawJob]:
+        # FastJobs is often tricky for search queries; grab latest jobs and let scoring filter.
         base = "https://www.fastjobs.sg/singapore-jobs/en/latest-jobs-jobs/"
-        r = requests.get(base, headers=HEADERS, timeout=30)
-        r.raise_for_status()
 
-        soup = BeautifulSoup(r.text, "lxml")
-        qn = query.strip().lower()
+        try:
+            r = requests.get(base, headers=HEADERS, timeout=30)
+            if r.status_code != 200:
+                return []
+        except Exception:
+            return []
 
+        soup = BeautifulSoup(r.text, "html.parser")
         jobs: List[RawJob] = []
+
         for a in soup.select("a[href*='/singapore-job-ad/']"):
             href = a.get("href") or ""
             if not href:
@@ -37,10 +43,6 @@ class FastJobsConnector(BaseConnector):
 
             title = _clean(a.get_text(" ", strip=True))
             if len(title) < 3:
-                continue
-
-            # keyword filter (basic)
-            if qn and qn not in title.lower():
                 continue
 
             if any(j.url == full for j in jobs):
@@ -59,8 +61,9 @@ class FastJobsConnector(BaseConnector):
     def _fetch_detail(self, job_url: str) -> RawJob:
         try:
             r = requests.get(job_url, headers=HEADERS, timeout=30)
-            r.raise_for_status()
-            soup = BeautifulSoup(r.text, "lxml")
+            if r.status_code != 200:
+                raise RuntimeError("Bad status")
+            soup = BeautifulSoup(r.text, "html.parser")
 
             title = ""
             h1 = soup.select_one("h1")
@@ -80,15 +83,15 @@ class FastJobsConnector(BaseConnector):
             if m_sal:
                 salary = _clean(m_sal.group(0))
 
-            if "Full Time" in text or "Full-time" in text:
+            if re.search(r"\bfull[- ]?time\b", text, re.IGNORECASE):
                 job_type = "Full-time"
-            elif "Part Time" in text or "Part-time" in text:
+            elif re.search(r"\bpart[- ]?time\b", text, re.IGNORECASE):
                 job_type = "Part-time"
-            elif "Contract" in text:
+            elif re.search(r"\bcontract\b", text, re.IGNORECASE):
                 job_type = "Contract"
 
             bullets = [_clean(li.get_text(" ", strip=True)) for li in soup.select("li")]
-            bullets = [b for b in bullets if 6 <= len(b) <= 80][:3]
+            bullets = [b for b in bullets if 6 <= len(b) <= 90][:3]
             if bullets:
                 reqs = "\n".join([f"• {b}" for b in bullets])
 
