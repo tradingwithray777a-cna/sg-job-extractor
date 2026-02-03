@@ -1,10 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 import re
 
-from src.keywords import build_keyword_sets
 from src.scoring import compute_relevance, closing_passed
 
 from src.connectors.mycareersfuture import MyCareersFutureConnector
@@ -12,13 +12,13 @@ from src.connectors.grabjobs import GrabJobsConnector
 from src.connectors.foundit import FounditConnector
 from src.connectors.fastjobs import FastJobsConnector
 
-# --------- SAFE IMPORT: Excel writer (prevents ImportError) ----------
+# --------- SAFE IMPORT: Excel writer ----------
 try:
-    from src.excel_writer import write_excel  # preferred if available
+    from src.excel_writer import write_excel  # preferred
 except Exception:
-    write_excel = None  # fallback will be used
+    write_excel = None
 
-# --------- Fallback Excel writer (openpyxl-only) ----------
+
 def _fallback_write_excel(jobs: List[Dict], notes: Dict, out_path: str) -> str:
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill
@@ -42,7 +42,6 @@ def _fallback_write_excel(jobs: List[Dict], notes: Dict, out_path: str) -> str:
     wb = Workbook()
     ws = wb.active
     ws.title = "Jobs"
-
     ws.append(JOBS_COLS)
     ws.freeze_panes = "A2"
 
@@ -56,14 +55,13 @@ def _fallback_write_excel(jobs: List[Dict], notes: Dict, out_path: str) -> str:
     for r in jobs:
         ws.append([r.get(c, "") for c in JOBS_COLS])
 
-    # Hyperlinks in URL column (3rd col)
+    # hyperlinks on URL column
     for row in range(2, ws.max_row + 1):
         cell = ws.cell(row=row, column=3)
         if isinstance(cell.value, str) and cell.value.startswith("http"):
             cell.hyperlink = cell.value
             cell.font = Font(color="0000EE", underline="single")
 
-    # Excel table
     end_col = get_column_letter(len(JOBS_COLS))
     end_row = ws.max_row
     tab = Table(displayName="JobsTable", ref=f"A1:{end_col}{end_row}")
@@ -74,17 +72,6 @@ def _fallback_write_excel(jobs: List[Dict], notes: Dict, out_path: str) -> str:
     )
     ws.add_table(tab)
 
-    # Simple column width
-    for col in range(1, len(JOBS_COLS) + 1):
-        max_len = 10
-        for rr in range(1, min(ws.max_row, 200) + 1):
-            v = ws.cell(row=rr, column=col).value
-            if v is None:
-                continue
-            max_len = max(max_len, len(str(v)))
-        ws.column_dimensions[get_column_letter(col)].width = min(60, max_len + 2)
-
-    # Notes sheet
     ws2 = wb.create_sheet("Notes")
     ws2.append(["Item", "Value"])
     ws2.freeze_panes = "A2"
@@ -92,7 +79,6 @@ def _fallback_write_excel(jobs: List[Dict], notes: Dict, out_path: str) -> str:
     ws2.column_dimensions["B"].width = 120
     ws2["A1"].font = Font(bold=True)
     ws2["B1"].font = Font(bold=True)
-
     for k, v in (notes or {}).items():
         ws2.append([str(k), str(v)])
 
@@ -104,6 +90,157 @@ def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip().lower())
 
 
+# ---------------- Keyword sets (embedded to bypass broken src/keywords.py) ----------------
+@dataclass
+class KeywordSets:
+    target_role: str
+    core_keywords: List[str]
+    adjacent_titles: List[str]
+    nearby_titles: List[str]
+    exclude_keywords: List[str]
+
+
+def build_keyword_sets(target_role: str) -> KeywordSets:
+    tr = (target_role or "").strip()
+    tr_n = _norm(tr)
+
+    synonyms = {
+        "officer": ["executive", "specialist", "coordinator"],
+        "procurement": ["sourcing", "purchasing", "vendor management", "supplier management", "category management"],
+        "receptionist": ["front desk", "front office", "guest services", "customer service"],
+        "community": ["engagement", "outreach", "relations"],
+        "partnership": ["alliances", "stakeholder", "collaboration", "partnerships"],
+        "engineer": ["engineering"],
+        "civil": ["construction", "infrastructure"],
+    }
+
+    words = [w for w in tr_n.split(" ") if w]
+    core = [tr]
+    for w in words:
+        if w in synonyms:
+            core.extend(synonyms[w])
+
+    def dedupe(lst: List[str], cap: int) -> List[str]:
+        out: List[str] = []
+        seen = set()
+        for x in lst:
+            xn = _norm(x)
+            if xn and xn not in seen:
+                out.append(x)
+                seen.add(xn)
+            if len(out) >= cap:
+                break
+        return out
+
+    core_keywords = dedupe(core, 10)
+
+    adjacent: List[str] = []
+    nearby: List[str] = []
+    exclude: List[str] = []
+
+    if "receptionist" in tr_n:
+        adjacent = [
+            "Front Desk Officer",
+            "Front Office Executive",
+            "Reception Executive",
+            "Clinic Receptionist",
+            "Hotel Receptionist",
+            "Guest Service Officer",
+            "Administrative Receptionist",
+            "Office Receptionist",
+            "Lobby Ambassador",
+            "Concierge (Front Desk)",
+        ]
+        nearby = [
+            "Administrative Assistant",
+            "Office Administrator",
+            "Customer Service Officer",
+            "Guest Relations Officer",
+            "Admin Coordinator",
+            "Clinic Assistant",
+            "Service Desk Officer",
+            "Facilities Coordinator",
+            "Call Centre Agent",
+        ]
+        exclude = ["telemarketer", "commission only"]
+
+    elif "procurement" in tr_n:
+        adjacent = [
+            "Procurement Executive",
+            "Procurement Specialist",
+            "Sourcing Specialist",
+            "Purchasing Officer",
+            "Purchasing Executive",
+            "Buyer",
+            "Senior Buyer",
+            "Category Executive",
+            "Vendor Management Executive",
+            "Procurement Coordinator",
+            "Strategic Sourcing Executive",
+            "Supply Chain Procurement Executive",
+        ]
+        nearby = [
+            "Supply Chain Executive",
+            "Logistics Executive",
+            "Operations Executive",
+            "Inventory Planner",
+            "Materials Planner",
+            "Contracts Executive",
+            "Contract Administrator",
+            "Purchase-to-Pay (P2P) Executive",
+            "Vendor Coordinator",
+            "Demand Planner",
+        ]
+        exclude = ["software engineer", "developer", "sap developer"]
+
+    elif ("community" in tr_n and "partnership" in tr_n) or ("community partnership" in tr_n):
+        adjacent = [
+            "Community Partnerships Executive",
+            "Partnerships Executive",
+            "Community Engagement Executive",
+            "Stakeholder Management Executive",
+            "Community Outreach Executive",
+            "Partnerships Manager",
+            "Strategic Partnerships Executive",
+            "Partnership Development Executive",
+            "Community Relations Executive",
+            "Stakeholder Engagement Officer",
+            "Partnership Officer",
+        ]
+        nearby = [
+            "Programme Executive",
+            "Programme Coordinator",
+            "Corporate Relations Executive",
+            "Business Development Executive",
+            "Account Executive (Partnerships)",
+            "CSR Executive",
+            "Events Executive",
+            "Community Development Executive",
+            "Stakeholder Relations Officer",
+        ]
+        exclude = []
+
+    else:
+        adjacent = [
+            f"{tr} Executive",
+            f"{tr} Specialist",
+            f"Senior {tr}",
+            f"Assistant {tr}",
+            f"{tr} Coordinator",
+        ]
+        nearby = ["Operations Executive", "Coordinator", "Executive", "Specialist"]
+        exclude = []
+
+    return KeywordSets(
+        target_role=tr,
+        core_keywords=core_keywords,
+        adjacent_titles=dedupe(adjacent, 20),
+        nearby_titles=dedupe(nearby, 20),
+        exclude_keywords=dedupe(exclude, 10),
+    )
+
+
+# ---------------- Connectors ----------------
 CONNECTORS = {
     "MyCareersFuture": MyCareersFutureConnector(),
     "GrabJobs": GrabJobsConnector(),
@@ -113,12 +250,6 @@ CONNECTORS = {
 
 
 def build_queries(target_role: str, adjacent_titles: List[str], core_keywords: List[str]) -> List[Tuple[str, str]]:
-    """
-    Must have 3 variations per portal:
-    - Exact
-    - Adjacent (pick 2–3)
-    - Skill-based (combine 2–3 core keywords)
-    """
     queries: List[Tuple[str, str]] = []
     queries.append((target_role, "Exact"))
 
@@ -158,7 +289,6 @@ def run_search(
 
         portal_hits = 0
 
-        # enforce 3 query variations
         for q, qtype in queries[:3]:
             try:
                 jobs = conn.search(q, limit=80)
@@ -169,15 +299,15 @@ def run_search(
 
             for j in jobs:
                 raw_rows.append({
-                    "Job title available": j.title or "Not stated",
-                    "employer": j.employer or "Not stated",
-                    "job post url link": j.url,
+                    "Job title available": getattr(j, "title", "") or "Not stated",
+                    "employer": getattr(j, "employer", "") or "Not stated",
+                    "job post url link": getattr(j, "url", "") or "",
                     "job post from what source": portal,
-                    "date job post was posted": j.posted_date or "Unverified",
-                    "application closing date": j.closing_date or "Not stated",
-                    "key job requirement": j.requirements or "• Not stated",
-                    "estimated salary": j.salary or "Not stated",
-                    "job full-time or part-time": j.job_type or "Not stated",
+                    "date job post was posted": getattr(j, "posted_date", "") or "Unverified",
+                    "application closing date": getattr(j, "closing_date", "") or "Not stated",
+                    "key job requirement": getattr(j, "requirements", "") or "• Not stated",
+                    "estimated salary": getattr(j, "salary", "") or "Not stated",
+                    "job full-time or part-time": getattr(j, "job_type", "") or "Not stated",
                 })
                 if len(raw_rows) >= raw_cap:
                     break
@@ -191,7 +321,7 @@ def run_search(
 
     raw_count = len(raw_rows)
 
-    # Filter exclude keywords (title)
+    # Filter exclude keywords
     filtered = []
     excl = [_norm(x) for x in ks.exclude_keywords]
     for r in raw_rows:
@@ -201,33 +331,30 @@ def run_search(
         filtered.append(r)
     after_filter = len(filtered)
 
-    # Deduplicate by (title + employer) keeping "best completeness"
+    # Deduplicate by (title + employer)
     def completeness_key(r: Dict):
-        verifiable_posted = 1 if r.get("date job post was posted") not in ("Unverified", "", None) else 0
-        closing_present = 1 if r.get("application closing date") not in ("Not stated", "", None) else 0
-        salary_present = 1 if r.get("estimated salary") not in ("Not stated", "", None) else 0
+        ver = 1 if r.get("date job post was posted") not in ("Unverified", "", None) else 0
+        clo = 1 if r.get("application closing date") not in ("Not stated", "", None) else 0
+        sal = 1 if r.get("estimated salary") not in ("Not stated", "", None) else 0
         req_len = len((r.get("key job requirement") or "").strip())
-        return (verifiable_posted, closing_present, salary_present, req_len)
+        return (ver, clo, sal, req_len)
 
     best = {}
     for r in filtered:
         k = (_norm(r.get("Job title available", "")), _norm(r.get("employer", "")))
-        if k not in best:
+        if k not in best or completeness_key(r) > completeness_key(best[k]):
             best[k] = r
-        else:
-            if completeness_key(r) > completeness_key(best[k]):
-                best[k] = r
 
     deduped = list(best.values())
     after_dedupe = len(deduped)
 
-    # Score + closing flag
+    # Score + closing
     today = datetime.now().date()
     for r in deduped:
         r["Relevance score"] = compute_relevance(r, ks.target_role, ks.adjacent_titles, ks.nearby_titles)
         r["Closing date passed? (Y/N)"] = closing_passed(r.get("application closing date", "Not stated"), today=today)
 
-    # Sort: relevance desc, verifiable posted date first, newest first
+    # Sort
     def sort_key(r: Dict):
         ver = 0 if r.get("date job post was posted") == "Unverified" else 1
         try:
@@ -237,6 +364,7 @@ def run_search(
         return (-int(r.get("Relevance score", 0)), -ver, -(d.toordinal()))
 
     deduped.sort(key=sort_key)
+
     final = deduped[:max_final]
     final_count = len(final)
 
@@ -252,7 +380,6 @@ def run_search(
         "Excel writer mode": "src.excel_writer.write_excel used" if write_excel else "fallback writer used (openpyxl)",
     }
 
-    # Write Excel using preferred writer if available; otherwise fallback
     if write_excel:
         return write_excel(final, notes, out_path)
     return _fallback_write_excel(final, notes, out_path)
