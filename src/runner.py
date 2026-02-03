@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple
 import re
 
 from src.scoring import compute_relevance, closing_passed
@@ -90,7 +90,7 @@ def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip().lower())
 
 
-# ---------------- Keyword sets (embedded to bypass broken src/keywords.py) ----------------
+# ---------------- Keyword sets (embedded; NO src/keywords import) ----------------
 @dataclass
 class KeywordSets:
     target_role: str
@@ -110,11 +110,10 @@ def build_keyword_sets(target_role: str) -> KeywordSets:
         "receptionist": ["front desk", "front office", "guest services", "customer service"],
         "community": ["engagement", "outreach", "relations"],
         "partnership": ["alliances", "stakeholder", "collaboration", "partnerships"],
-        "engineer": ["engineering"],
-        "civil": ["construction", "infrastructure"],
     }
 
     words = [w for w in tr_n.split(" ") if w]
+
     core = [tr]
     for w in words:
         if w in synonyms:
@@ -140,94 +139,52 @@ def build_keyword_sets(target_role: str) -> KeywordSets:
 
     if "receptionist" in tr_n:
         adjacent = [
-            "Front Desk Officer",
-            "Front Office Executive",
-            "Reception Executive",
-            "Clinic Receptionist",
-            "Hotel Receptionist",
-            "Guest Service Officer",
-            "Administrative Receptionist",
-            "Office Receptionist",
-            "Lobby Ambassador",
+            "Front Desk Officer", "Front Office Executive", "Reception Executive",
+            "Clinic Receptionist", "Hotel Receptionist", "Guest Service Officer",
+            "Administrative Receptionist", "Office Receptionist", "Lobby Ambassador",
             "Concierge (Front Desk)",
         ]
         nearby = [
-            "Administrative Assistant",
-            "Office Administrator",
-            "Customer Service Officer",
-            "Guest Relations Officer",
-            "Admin Coordinator",
-            "Clinic Assistant",
-            "Service Desk Officer",
-            "Facilities Coordinator",
-            "Call Centre Agent",
+            "Administrative Assistant", "Office Administrator", "Customer Service Officer",
+            "Guest Relations Officer", "Admin Coordinator", "Clinic Assistant",
+            "Service Desk Officer", "Facilities Coordinator", "Call Centre Agent",
         ]
         exclude = ["telemarketer", "commission only"]
 
     elif "procurement" in tr_n:
         adjacent = [
-            "Procurement Executive",
-            "Procurement Specialist",
-            "Sourcing Specialist",
-            "Purchasing Officer",
-            "Purchasing Executive",
-            "Buyer",
-            "Senior Buyer",
-            "Category Executive",
-            "Vendor Management Executive",
-            "Procurement Coordinator",
-            "Strategic Sourcing Executive",
-            "Supply Chain Procurement Executive",
+            "Procurement Executive", "Procurement Specialist", "Sourcing Specialist",
+            "Purchasing Officer", "Purchasing Executive", "Buyer", "Senior Buyer",
+            "Category Executive", "Vendor Management Executive", "Procurement Coordinator",
+            "Strategic Sourcing Executive", "Supply Chain Procurement Executive",
         ]
         nearby = [
-            "Supply Chain Executive",
-            "Logistics Executive",
-            "Operations Executive",
-            "Inventory Planner",
-            "Materials Planner",
-            "Contracts Executive",
-            "Contract Administrator",
-            "Purchase-to-Pay (P2P) Executive",
-            "Vendor Coordinator",
-            "Demand Planner",
+            "Supply Chain Executive", "Logistics Executive", "Operations Executive",
+            "Inventory Planner", "Materials Planner", "Contracts Executive",
+            "Contract Administrator", "Purchase-to-Pay (P2P) Executive",
+            "Vendor Coordinator", "Demand Planner",
         ]
         exclude = ["software engineer", "developer", "sap developer"]
 
     elif ("community" in tr_n and "partnership" in tr_n) or ("community partnership" in tr_n):
         adjacent = [
-            "Community Partnerships Executive",
-            "Partnerships Executive",
-            "Community Engagement Executive",
-            "Stakeholder Management Executive",
-            "Community Outreach Executive",
-            "Partnerships Manager",
-            "Strategic Partnerships Executive",
-            "Partnership Development Executive",
-            "Community Relations Executive",
-            "Stakeholder Engagement Officer",
+            "Community Partnerships Executive", "Partnerships Executive",
+            "Community Engagement Executive", "Stakeholder Management Executive",
+            "Community Outreach Executive", "Partnerships Manager",
+            "Strategic Partnerships Executive", "Partnership Development Executive",
+            "Community Relations Executive", "Stakeholder Engagement Officer",
             "Partnership Officer",
         ]
         nearby = [
-            "Programme Executive",
-            "Programme Coordinator",
-            "Corporate Relations Executive",
-            "Business Development Executive",
-            "Account Executive (Partnerships)",
-            "CSR Executive",
-            "Events Executive",
-            "Community Development Executive",
+            "Programme Executive", "Programme Coordinator", "Corporate Relations Executive",
+            "Business Development Executive", "Account Executive (Partnerships)",
+            "CSR Executive", "Events Executive", "Community Development Executive",
             "Stakeholder Relations Officer",
         ]
         exclude = []
 
     else:
-        adjacent = [
-            f"{tr} Executive",
-            f"{tr} Specialist",
-            f"Senior {tr}",
-            f"Assistant {tr}",
-            f"{tr} Coordinator",
-        ]
+        adjacent = [f"{tr} Executive", f"{tr} Specialist", f"Senior {tr}", f"Assistant {tr}", f"{tr} Coordinator"]
         nearby = ["Operations Executive", "Coordinator", "Executive", "Specialist"]
         exclude = []
 
@@ -252,7 +209,6 @@ CONNECTORS = {
 def build_queries(target_role: str, adjacent_titles: List[str], core_keywords: List[str]) -> List[Tuple[str, str]]:
     queries: List[Tuple[str, str]] = []
     queries.append((target_role, "Exact"))
-
     for t in (adjacent_titles or [])[:3]:
         queries.append((t, "Adjacent"))
 
@@ -348,7 +304,7 @@ def run_search(
     deduped = list(best.values())
     after_dedupe = len(deduped)
 
-    # Score + closing
+    # Score + closing date flag
     today = datetime.now().date()
     for r in deduped:
         r["Relevance score"] = compute_relevance(r, ks.target_role, ks.adjacent_titles, ks.nearby_titles)
@@ -364,7 +320,6 @@ def run_search(
         return (-int(r.get("Relevance score", 0)), -ver, -(d.toordinal()))
 
     deduped.sort(key=sort_key)
-
     final = deduped[:max_final]
     final_count = len(final)
 
