@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import List
 from urllib.parse import quote_plus, urljoin
+import re
 
 from bs4 import BeautifulSoup
 
@@ -12,13 +13,18 @@ HEADERS = {
     "Accept-Language": "en-SG,en;q=0.9",
 }
 
+def _slugify(q: str) -> str:
+    q = (q or "").strip().lower()
+    q = re.sub(r"[^\w\s-]", " ", q)
+    q = re.sub(r"\s+", "-", q).strip("-")
+    return q or "jobs"
 
 class FastJobsConnector(BaseConnector):
     source_name = "FastJobs"
 
     def search(self, query: str, limit: int = 80) -> List[RawJob]:
-        q = quote_plus((query or "").strip())
-        url = f"https://www.fastjobs.sg/singapore-jobs-search/{q}/?source=search"
+        slug = _slugify(query)
+        url = f"https://www.fastjobs.sg/singapore-jobs-search/{slug}/?source=search"
 
         status, final_url, html = self.http_get(url, headers=HEADERS, timeout=30)
         if status != 200 or not html:
@@ -31,16 +37,13 @@ class FastJobsConnector(BaseConnector):
             href = a.get("href") or ""
             if "/singapore-job-ad/" not in href:
                 continue
-
             full = href if href.startswith("http") else urljoin("https://www.fastjobs.sg", href)
             if full not in links:
                 links.append(full)
-
             if len(links) >= limit:
                 break
 
         self._set_debug(found_links=len(links))
-
         jobs: List[RawJob] = []
         for job_url in links[:limit]:
             jobs.append(
@@ -56,5 +59,4 @@ class FastJobsConnector(BaseConnector):
                     job_type="Not stated",
                 )
             )
-
         return jobs
