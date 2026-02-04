@@ -10,34 +10,60 @@ from bs4 import BeautifulSoup
 from .base import BaseConnector, RawJob
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122 Safari/537.36",
     "Accept-Language": "en-SG,en;q=0.9",
 }
 
 def _clean(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
-def _looks_like_ui(text: str) -> bool:
-    t = (text or "").strip().lower()
-    bad = [
-        "what’s your preferred work location",
-        "what's your preferred work location",
-        "filter",
-        "sort",
-        "job alerts",
-        "sign in",
-        "login",
-    ]
-    return (len(t) < 4) or any(b in t for b in bad)
+def _looks_like_title(s: str) -> bool:
+    if not s:
+        return False
+    s2 = s.lower()
+    bad = ["last updated on", "s$", " / month", " / hour", "region", "featured ad", "work location", "job type"]
+    if any(b in s2 for b in bad):
+        return False
+    # titles are typically 5–120 chars
+    return 5 <= len(s) <= 140
+
+def _pick_title_from_card_text(card_text: str) -> str:
+    """
+    FastJobs cards often concatenate everything. We pick the first plausible title-like segment.
+    """
+    txt = card_text.replace("Featured Ad", "\n")
+    # split on newlines-ish separators
+    parts = re.split(r"[\n\r]|(?:\s{2,})|(?:\s\|\s)|(?:\s·\s)", txt)
+    parts = [_clean(p) for p in parts if _clean(p)]
+    for p in parts:
+        if _looks_like_title(p):
+            return p[:200]
+    # fallback: first 80 chars
+    return (_clean(card_text)[:80] or "Not stated")
+
+def _extract_employer(card_text: str) -> str:
+    t = _clean(card_text)
+    # sometimes appears twice: "COMPANY COMPANY"
+    # try to find a duplicated company name near the end
+    # common heuristic: last 2 identical chunks
+    chunks = re.split(r"\s{2,}", t)
+    chunks = [c for c in chunks if c]
+    if len(chunks) >= 2 and chunks[-1] == chunks[-2] and 3 <= len(chunks[-1]) <= 80:
+        return _clean(chunks[-1])
+
+    # fallback: look for patterns like " PTE LTD" / " LTD" in the card
+    m = re.search(r"([A-Za-z0-9&().,'\- ]{3,80}\b(?:PTE\.?\s*LTD\.?|LTD\.?|LIMITED|LLP|INC\.?)\b)", t, re.IGNORECASE)
+    if m:
+        return _clean(m.group(1))
+
+    return "Not stated"
 
 class FastJobsConnector(BaseConnector):
     source_name = "FastJobs"
 
     def search(self, query: str, limit: int = 80) -> List[RawJob]:
-        # FastJobs search (keyword)
-        # This URL pattern works commonly; if FastJobs changes it, we’ll adjust.
         q = quote_plus(query.strip())
-        url = f"https://www.fastjobs.sg/singapore-jobs/en/search-jobs/{q}/"
+        url = f"https://www.fastjobs.sg/singapore-jobs-search/{q}/?source=search"
 
         try:
             r = requests.get(url, headers=HEADERS, timeout=30)
@@ -47,96 +73,60 @@ class FastJobsConnector(BaseConnector):
             return []
 
         soup = BeautifulSoup(r.text, "html.parser")
-        jobs: List[RawJob] = []
 
-        # job ad links usually contain /singapore-job-ad/
-        for a in soup.select("a[href*='/singapore-job-ad/']"):
+        # FastJobs job ad pages look like /singapore-job-ad/<id>/...
+        links = []
+        for a in soup.find_all("a", href=True):
             href = a.get("href") or ""
-            if not href:
+            if "/singapore-job-ad/" not in href:
                 continue
             full = href if href.startswith("http") else urljoin("https://www.fastjobs.sg", href)
+            if full not in links:
+                links.append(full)
+            if len(links) >= limit:
+                break
 
-            title = _clean(a.get_text(" ", strip=True))
-            if _looks_like_ui(title):
-                continue
+        jobs: List[RawJob] = []
+        for job_url in links:
+            # Try to use the anchor's parent text as a "card blob"
+            # This helps extract title/employer without fetching details.
+            title = "Not stated"
+            employer = "Not stated"
 
-            if any(j.url == full for j in jobs):
-                continue
+            # best-effort: find the anchor in soup again and climb to a container
+            a = soup.find("a", href=lambda x: x and job_url.replace("https://www.fastjobs.sg", "") in x)
+            card_text = ""
+            if a:
+                # climb to a likely card container
+                node = a
+                for _ in range(6):
+                    if not node:
+                        break
+                    card_text = _clean(node.get_text(" ", strip=True))
+                    # once it's sufficiently long, it's probably the whole card
+                    if len(card_text) > 120:
+                        break
+                    node = node.parent
 
-            det = self._fetch_detail(full)
-            if not det.title:
-                det.title = title
+            if card_text:
+                title = _pick_title_from_card_text(card_text)
+                employer = _extract_employer(card_text)
 
-            # one more UI sanity check
-            if _looks_like_ui(det.title):
-                continue
+            jobs.append(
+                RawJob(
+                    title=title or "Not stated",
+                    employer=employer or "Not stated",
+                    url=job_url,
+                    source=self.source_name,
+                    posted_date="Unverified",
+                    closing_date="Not stated",
+                    requirements="• Not stated",
+                    salary="Not stated",
+                    job_type="Not stated",
+                )
+            )
 
-            jobs.append(det)
             if len(jobs) >= limit:
                 break
 
         return jobs
-
-    def _fetch_detail(self, job_url: str) -> RawJob:
-        try:
-            r = requests.get(job_url, headers=HEADERS, timeout=30)
-            if r.status_code != 200:
-                raise RuntimeError("Bad status")
-
-            soup = BeautifulSoup(r.text, "html.parser")
-            title = ""
-            h1 = soup.select_one("h1")
-            if h1:
-                title = _clean(h1.get_text(" ", strip=True))[:200]
-
-            text = soup.get_text("\n", strip=True)
-
-            employer = "Not stated"
-            salary = "Not stated"
-            job_type = "Not stated"
-            posted = "Unverified"
-            closing = "Not stated"
-            reqs = "• Not stated"
-
-            # requirements: first 3 meaningful li items
-            bullets = [_clean(li.get_text(" ", strip=True)) for li in soup.select("li")]
-            bullets = [b for b in bullets if 6 <= len(b) <= 90][:3]
-            if bullets:
-                reqs = "\n".join([f"• {b}" for b in bullets])
-
-            # job type detection
-            if re.search(r"\bfull[- ]?time\b", text, re.IGNORECASE):
-                job_type = "Full-time"
-            elif re.search(r"\bpart[- ]?time\b", text, re.IGNORECASE):
-                job_type = "Part-time"
-            elif re.search(r"\bcontract\b", text, re.IGNORECASE):
-                job_type = "Contract"
-
-            # salary (basic heuristic)
-            m_sal = re.search(r"S\$\s*[\d,]+(\s*-\s*[\d,]+)?", text, re.IGNORECASE)
-            if m_sal:
-                salary = _clean(m_sal.group(0))
-
-            return RawJob(
-                title=title,
-                employer=employer,
-                url=job_url,
-                source=self.source_name,
-                posted_date=posted,
-                closing_date=closing,
-                requirements=reqs,
-                salary=salary,
-                job_type=job_type,
-            )
-        except Exception:
-            return RawJob(
-                title="",
-                employer="Not stated",
-                url=job_url,
-                source=self.source_name,
-                posted_date="Unverified",
-                closing_date="Not stated",
-                requirements="• Not stated",
-                salary="Not stated",
-                job_type="Not stated",
-            )
