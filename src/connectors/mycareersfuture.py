@@ -21,15 +21,8 @@ class MyCareersFutureConnector(BaseConnector):
     source_name = "MyCareersFuture"
 
     def search(self, query: str, limit: int = 80) -> List[RawJob]:
-        """
-        Lightweight HTML scrape:
-        - Collect job card links
-        - Extract title + employer where visible
-        Note: MCF layout can change; this aims to be resilient.
-        """
         q = quote_plus(query.strip())
-        # MCF search URL pattern (public)
-        url = f"https://www.mycareersfuture.gov.sg/search?search={q}&sortBy=relevancy&page=0"
+        url = f"https://www.mycareersfuture.gov.sg/search?search={q}&sortBy=new_posting_date&page=0"
 
         try:
             r = requests.get(url, headers=HEADERS, timeout=30)
@@ -38,54 +31,56 @@ class MyCareersFutureConnector(BaseConnector):
         except Exception:
             return []
 
-        soup = BeautifulSoup(r.text, "html.parser")
+        html = r.text
+        soup = BeautifulSoup(html, "html.parser")
 
-        jobs: List[RawJob] = []
-
-        # Strategy: find anchors that look like job pages
-        # MCF job links usually contain "/job/" or "/job/"-like routes
-        anchors = soup.find_all("a", href=True)
-
-        for a in anchors:
+        # Collect job links
+        links = []
+        for a in soup.find_all("a", href=True):
             href = a.get("href") or ""
             if not href:
                 continue
+            if "/job/" in href:
+                full = href if href.startswith("http") else urljoin("https://www.mycareersfuture.gov.sg", href)
+                if full not in links:
+                    links.append(full)
+            if len(links) >= limit * 2:
+                break
 
-            # Heuristic: job detail pages include "/job/" in URL
-            if "/job/" not in href:
-                continue
+        # Regex fallback if anchors fail
+        if not links:
+            hits = re.findall(r'"/job/[^"\s]+"' , html)
+            for h in hits:
+                h = h.strip('"')
+                full = urljoin("https://www.mycareersfuture.gov.sg", h)
+                if full not in links:
+                    links.append(full)
+                if len(links) >= limit * 2:
+                    break
 
-            job_url = href if href.startswith("http") else urljoin("https://www.mycareersfuture.gov.sg", href)
+        jobs: List[RawJob] = []
 
-            # title text from anchor or nearby h3/h2
-            title = _clean(a.get_text(" ", strip=True))
-            if not title or len(title) < 3:
-                # look for header inside card
+        # Create minimal jobs (title extraction best-effort)
+        for job_url in links[:limit]:
+            title = "Not stated"
+
+            # Try to find anchor node again to extract text
+            rel = job_url.replace("https://www.mycareersfuture.gov.sg", "")
+            a = soup.find("a", href=lambda x: x and rel in x)
+            if a:
+                # Look for h3/h2 around it
                 h = a.find(["h1", "h2", "h3"])
                 if h:
-                    title = _clean(h.get_text(" ", strip=True))
-
-            # employer: look at parent card for possible employer text
-            employer = "Not stated"
-            card = a
-            for _ in range(4):
-                if not card:
-                    break
-                card = card.parent
-                if not card:
-                    break
-                txt = _clean(card.get_text(" ", strip=True))
-                # Try to detect "Company:" patterns or common MCF card structure
-                # This is best-effort; if uncertain keep Not stated.
-                m = re.search(r"Company\s*[:\-]\s*([A-Za-z0-9&().,'\-/ ]{3,80})", txt, re.IGNORECASE)
-                if m:
-                    employer = _clean(m.group(1))
-                    break
+                    title = _clean(h.get_text(" ", strip=True))[:200]
+                else:
+                    t = _clean(a.get_text(" ", strip=True))
+                    if t:
+                        title = t[:200]
 
             jobs.append(
                 RawJob(
                     title=title or "Not stated",
-                    employer=employer or "Not stated",
+                    employer="Not stated",
                     url=job_url,
                     source=self.source_name,
                     posted_date="Unverified",
@@ -96,10 +91,7 @@ class MyCareersFutureConnector(BaseConnector):
                 )
             )
 
-            if len(jobs) >= limit:
-                break
-
-        # Dedup by URL (MCF can repeat anchors)
+        # Dedup by URL
         seen = set()
         out = []
         for j in jobs:
@@ -107,4 +99,3 @@ class MyCareersFutureConnector(BaseConnector):
                 out.append(j)
                 seen.add(j.url)
         return out[:limit]
-
