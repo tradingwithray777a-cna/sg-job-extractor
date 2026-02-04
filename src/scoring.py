@@ -17,24 +17,12 @@ def _words(s: str) -> List[str]:
     return toks
 
 
-def should_keep_title(title: str, target_role: str, adjacent_titles: List[str], nearby_titles: List[str]) -> bool:
+def should_keep_title(*args, **kwargs) -> bool:
     """
-    Hard gate, but SAFE:
-    - If title is missing/Not stated, keep it (so we don't end up with 0 rows).
-    - Otherwise require at least 1 meaningful overlap with target/adjacent/nearby vocab.
+    IMPORTANT: We disable the hard title gate to avoid empty Excel.
+    We will filter using relevance score AFTER scoring instead.
     """
-    t = _norm(title)
-    if not t or t in {"not stated", "unknown"}:
-        return True  # keep; portal likely blocked details
-
-    vocab = set(_words(target_role))
-    for a in (adjacent_titles or [])[:15]:
-        vocab.update(_words(a))
-    for n in (nearby_titles or [])[:15]:
-        vocab.update(_words(n))
-
-    title_tokens = set(_words(title))
-    return len(vocab.intersection(title_tokens)) >= 1
+    return True
 
 
 def compute_relevance(row: Dict, target_role: str, adjacent_titles: List[str], nearby_titles: List[str]) -> int:
@@ -45,21 +33,27 @@ def compute_relevance(row: Dict, target_role: str, adjacent_titles: List[str], n
     score = 0
 
     # A) Title match (max 140)
-    if _norm(target_role) in _norm(title):
+    title_n = _norm(title)
+    target_n = _norm(target_role)
+
+    if target_n and target_n in title_n:
         score += 120
     else:
         tr_words = _words(target_role)
-        if tr_words and all(w in _norm(title) for w in tr_words):
+        if tr_words and all(w in title_n for w in tr_words):
             score += 100
         else:
-            if any(_norm(a) in _norm(title) for a in (adjacent_titles or [])):
+            # adjacent strong match
+            if any(_norm(a) and _norm(a) in title_n for a in (adjacent_titles or [])):
                 score += 85
-            elif any(w in _norm(title) for w in _words(" ".join(nearby_titles or []))):
+            # nearby functional match
+            elif any(w in title_n for w in _words(" ".join(nearby_titles or []))):
                 score += 60
-            elif any(w in _norm(title) for w in _words(target_role)):
+            # partial overlap
+            elif any(w in title_n for w in _words(target_role)):
                 score += 30
 
-    # B) Domain/industry match (max 40) — heuristic
+    # B) Domain/industry match (max 40) — lightweight heuristic
     emp_n = _norm(employer)
     if any(k in emp_n for k in ["government", "agency", "community", "charity", "foundation", "association", "ngo", "service"]):
         score += 40
