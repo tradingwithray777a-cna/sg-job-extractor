@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import datetime, timedelta, date
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from urllib.parse import quote_plus, urljoin
 
 import requests
@@ -26,7 +26,6 @@ def _parse_iso_date(s: str) -> Optional[str]:
     if not s:
         return None
     s = s.strip()
-    # try first 10 chars
     try:
         d = datetime.strptime(s[:10], "%Y-%m-%d").date()
         return d.strftime("%Y-%m-%d")
@@ -52,15 +51,13 @@ def _extract_bullets(desc: str, max_bullets: int = 3) -> str:
     desc = re.sub(r"<[^>]+>", " ", desc)
     desc = re.sub(r"\s+", " ", desc).strip()
     parts = re.split(r"[•\n\r]|(?:\.\s+)|(?:;\s+)", desc)
-
     cands = []
     for p in parts:
         p = _clean(p)
         if 8 <= len(p) <= 90:
-            if any(x in p.lower() for x in ["apply", "privacy", "equal opportunity", "cookies"]):
+            if any(x in p.lower() for x in ["apply", "privacy", "cookies", "equal opportunity"]):
                 continue
             cands.append(p)
-
     out, seen = [], set()
     for c in cands:
         k = c.lower()
@@ -69,11 +66,9 @@ def _extract_bullets(desc: str, max_bullets: int = 3) -> str:
             seen.add(k)
         if len(out) >= max_bullets:
             break
-
     if not out:
         short = desc[:80].strip()
         return f"• {short}" if short else "• Not stated"
-
     return "\n".join([f"• {x}" for x in out])
 
 def _parse_jsonld_jobposting(soup: BeautifulSoup) -> Optional[dict]:
@@ -108,8 +103,6 @@ def _jobtype_from_jobposting(jp: dict) -> Optional[str]:
     if isinstance(et, list):
         et = " / ".join([str(x) for x in et if x])
     et = _clean(str(et))
-    if not et:
-        return None
     low = et.lower()
     if "full" in low:
         return "Full-time"
@@ -160,48 +153,51 @@ class FounditConnector(BaseConnector):
         html = r.text
         soup = BeautifulSoup(html, "html.parser")
 
-        # 1) Try normal anchors
-        links = []
+        # Collect (url, title) pairs from anchors if possible
+        pairs: List[Tuple[str, str]] = []
+
         for a in soup.select("a[href*='/job/']"):
             href = a.get("href") or ""
             if not href:
                 continue
             full = href if href.startswith("http") else urljoin("https://www.foundit.sg", href)
-            if "/job/" in full and full not in links:
-                links.append(full)
-            if len(links) >= limit * 2:
+            if "/job/" not in full:
+                continue
+            t = _clean(a.get_text(" ", strip=True))[:200]
+            if (full, t) not in pairs:
+                pairs.append((full, t))
+            if len(pairs) >= limit * 2:
                 break
 
-        # 2) Fallback: regex from raw HTML (Foundit often embeds URLs in scripts)
-        if not links:
+        # Fallback: regex URLs if anchors are not present
+        if not pairs:
             hits = re.findall(r'https://www\.foundit\.sg/job/[^"\'\s<]+', html)
-            for h in hits:
-                if h not in links:
-                    links.append(h)
-                if len(links) >= limit * 2:
-                    break
-
-        if not links:
-            # last fallback: relative /job/...
-            rel_hits = re.findall(r'"/job/[^"\'\s<]+"' , html)
-            for rh in rel_hits:
-                rh = rh.strip('"')
-                full = urljoin("https://www.foundit.sg", rh)
-                if full not in links:
-                    links.append(full)
-                if len(links) >= limit * 2:
-                    break
+            for h in hits[: limit * 2]:
+                pairs.append((h, ""))
 
         jobs: List[RawJob] = []
-        for job_url in links:
-            det = self._fetch_detail(job_url)
+        seen = set()
+
+        for job_url, search_title in pairs:
+            if job_url in seen:
+                continue
+            seen.add(job_url)
+
+            det = self._fetch_detail(job_url, fallback_title=search_title)
+
+            # If detail fetch is blocked, det will still carry fallback_title
             if det and det.title and det.title != "Not stated":
                 jobs.append(det)
+            elif det and det.url:
+                # keep minimal row even if title missing
+                jobs.append(det)
+
             if len(jobs) >= limit:
                 break
+
         return jobs
 
-    def _fetch_detail(self, job_url: str) -> RawJob:
+    def _fetch_detail(self, job_url: str, fallback_title: str = "") -> RawJob:
         try:
             r = requests.get(job_url, headers=HEADERS, timeout=30)
             if r.status_code != 200:
@@ -214,9 +210,7 @@ class FounditConnector(BaseConnector):
             if h1:
                 title = _clean(h1.get_text(" ", strip=True))[:200]
             if not title:
-                mt = soup.select_one("meta[property='og:title']")
-                if mt and mt.get("content"):
-                    title = _clean(mt["content"])[:200]
+                title = _clean(fallback_title)[:200] if fallback_title else "Not stated"
 
             jp = _parse_jsonld_jobposting(soup)
 
@@ -271,8 +265,9 @@ class FounditConnector(BaseConnector):
                 job_type=job_type or "Not stated",
             )
         except Exception:
+            # IMPORTANT: keep fallback title + url so we don't end with 0 rows
             return RawJob(
-                title="Not stated",
+                title=_clean(fallback_title)[:200] if fallback_title else "Not stated",
                 employer="Not stated",
                 url=job_url,
                 source=self.source_name,
