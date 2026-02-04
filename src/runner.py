@@ -8,6 +8,7 @@ from src.scoring import compute_relevance, closing_passed
 
 from src.connectors.foundit import FounditConnector
 from src.connectors.fastjobs import FastJobsConnector
+from src.connectors.mycareersfuture import MyCareersFutureConnector
 
 try:
     from src.excel_writer import write_excel
@@ -51,6 +52,7 @@ def _fallback_write_excel(jobs: List[Dict], notes: Dict, out_path: str) -> str:
     for r in jobs:
         ws.append([r.get(c, "") for c in JOBS_COLS])
 
+    # hyperlink URL column (C)
     for row in range(2, ws.max_row + 1):
         cell = ws.cell(row=row, column=3)
         if isinstance(cell.value, str) and cell.value.startswith("http"):
@@ -82,7 +84,14 @@ def _norm(s: str) -> str:
 
 
 class KeywordSets:
-    def __init__(self, target_role: str, core_keywords: List[str], adjacent_titles: List[str], nearby_titles: List[str], exclude_keywords: List[str]):
+    def __init__(
+        self,
+        target_role: str,
+        core_keywords: List[str],
+        adjacent_titles: List[str],
+        nearby_titles: List[str],
+        exclude_keywords: List[str],
+    ):
         self.target_role = target_role
         self.core_keywords = core_keywords
         self.adjacent_titles = adjacent_titles
@@ -93,31 +102,45 @@ class KeywordSets:
 def build_keyword_sets(target_role: str) -> KeywordSets:
     tr = (target_role or "").strip()
 
-    # Generic base
-    core = [tr, "partnership", "community", "stakeholder", "engagement", "programme", "outreach"]
+    core = [tr]
     adjacent = [
-        "Community Partnerships Executive",
-        "Partnerships Executive",
-        "Partnership Officer",
-        "Community Engagement Executive",
-        "Stakeholder Engagement Executive",
-        "Community Outreach Executive",
-        "Programme Executive (Partnership)",
-        "Corporate Partnerships Executive",
-        "Strategic Partnerships Executive",
-        "Partnership Development Executive",
+        f"{tr} Executive",
+        f"{tr} Officer",
+        f"{tr} Specialist",
+        f"Senior {tr}",
+        f"Assistant {tr}",
+        f"{tr} Coordinator",
+        f"{tr} Manager",
     ]
-    nearby = [
-        "Programme Executive",
-        "Programme Coordinator",
-        "CSR Executive",
-        "Corporate Relations Executive",
-        "Business Development Executive",
-        "Events Executive",
-        "Volunteer Management Executive",
-        "Community Manager",
-    ]
+    nearby = ["Programme Executive", "Stakeholder Management", "Partnerships Executive", "Community Engagement"]
     exclude = []
+
+    # Add small “helpful” defaults for Community Partnership
+    trn = _norm(tr)
+    if "community" in trn and "partnership" in trn:
+        core = [tr, "community", "partnership", "stakeholder", "engagement", "outreach", "volunteer"]
+        adjacent = [
+            "Community Partnerships Executive",
+            "Partnerships Executive",
+            "Partnership Officer",
+            "Community Engagement Executive",
+            "Stakeholder Engagement Executive",
+            "Community Outreach Executive",
+            "Programme Executive (Partnership)",
+            "Corporate Partnerships Executive",
+            "Strategic Partnerships Executive",
+            "Partnership Development Executive",
+        ]
+        nearby = [
+            "Programme Executive",
+            "Programme Coordinator",
+            "CSR Executive",
+            "Corporate Relations Executive",
+            "Business Development Executive",
+            "Events Executive",
+            "Volunteer Management Executive",
+            "Community Manager",
+        ]
 
     def dedupe(lst: List[str], cap: int) -> List[str]:
         out, seen = [], set()
@@ -139,19 +162,22 @@ def build_keyword_sets(target_role: str) -> KeywordSets:
     )
 
 
+# ✅ PORTALS WIRED HERE
 CONNECTORS = {
+    "MyCareersFuture": MyCareersFutureConnector(),
     "Foundit": FounditConnector(),
     "FastJobs": FastJobsConnector(),
 }
 
 
 def build_queries(target_role: str, adjacent_titles: List[str], core_keywords: List[str]) -> List[Tuple[str, str]]:
-    # 3 variations per portal (Exact / Adjacent / Skill-based)
     exact = (target_role, "Exact")
+
     adj = (adjacent_titles[0] if adjacent_titles else target_role, "Adjacent")
-    # skill-based: target + 2 core words
+
     cores = [c for c in (core_keywords or []) if _norm(c) != _norm(target_role)]
     skill = (f"{target_role} {cores[0]} {cores[1]}" if len(cores) >= 2 else target_role, "Skill-based")
+
     return [exact, adj, skill]
 
 
@@ -169,10 +195,10 @@ def run_search(
     raw_rows: List[Dict] = []
     portal_stats: Dict[str, Dict[str, int]] = {}
 
-    # >>> adjust this threshold as needed
-    min_relevance = 60
+    # Keep threshold moderate. If you want “some data no matter what”, reduce to 30.
+    min_relevance = 30
 
-    # collect
+    # Collect up to raw_cap rows across portals
     for portal in selected_portals:
         conn = CONNECTORS.get(portal)
         if not conn:
@@ -212,7 +238,7 @@ def run_search(
         if len(raw_rows) >= raw_cap:
             break
 
-    # dedupe (title + employer)
+    # Deduplicate (title+employer)
     def key(r): return (_norm(r["Job title available"]), _norm(r["employer"]))
     best = {}
     for r in raw_rows:
@@ -221,26 +247,24 @@ def run_search(
             best[k] = r
     deduped = list(best.values())
 
-    # score + closing
+    # Score + closing
     today = datetime.now().date()
     for r in deduped:
         r["Relevance score"] = compute_relevance(r, ks.target_role, ks.adjacent_titles, ks.nearby_titles)
         r["Closing date passed? (Y/N)"] = closing_passed(r.get("application closing date", "Not stated"), today=today)
 
-    # filter by relevance threshold (this replaces the hard gate)
     kept = [r for r in deduped if int(r.get("Relevance score", 0)) >= min_relevance]
 
-    # update portal kept stats
+    # Portal kept stats
     for p in portal_stats:
         portal_stats[p]["kept_after_score"] = sum(1 for r in kept if r.get("job post from what source") == p)
 
-    # sort by relevance desc; verified posted date above unverified
+    # Sort: relevance desc; verified posted date above unverified
     def sort_key(r):
         ver = 0 if r.get("date job post was posted") == "Unverified" else 1
         return (-int(r.get("Relevance score", 0)), -ver)
 
     kept.sort(key=sort_key)
-
     final = kept[:max_final]
 
     notes = {
@@ -254,9 +278,10 @@ def run_search(
         ),
         "Counts (raw → dedupe → kept_after_score → final)": f"{len(raw_rows)} → {len(deduped)} → {len(kept)} → {len(final)}",
         "Relevance threshold used": str(min_relevance),
-        "Foundit note": "If Foundit shows 0 returned, it is likely blocked/JS-rendered from Streamlit Cloud. Use other portals or consider manual export for Foundit.",
+        "Note": "If Foundit shows 0 returned, it is likely blocked/JS-rendered on Streamlit Cloud. MyCareersFuture should provide results for professional roles.",
     }
 
     if write_excel:
         return write_excel(final, notes, out_path)
+
     return _fallback_write_excel(final, notes, out_path)
