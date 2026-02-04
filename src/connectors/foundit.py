@@ -158,7 +158,7 @@ class FounditConnector(BaseConnector):
             return []
 
         html = r.text
-        soup = BeautifulSoup(html, "lxml")
+        soup = BeautifulSoup(html, "html.parser")
 
         # 1) Try normal anchors
         links = []
@@ -207,7 +207,7 @@ class FounditConnector(BaseConnector):
             if r.status_code != 200:
                 raise RuntimeError("Bad status")
 
-            soup = BeautifulSoup(r.text, "lxml")
+            soup = BeautifulSoup(r.text, "html.parser")
 
             title = ""
             h1 = soup.select_one("h1")
