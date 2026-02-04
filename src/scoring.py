@@ -19,12 +19,13 @@ def _words(s: str) -> List[str]:
 
 def should_keep_title(title: str, target_role: str, adjacent_titles: List[str], nearby_titles: List[str]) -> bool:
     """
-    Hard gate: keep only jobs whose title overlaps with target/adjacent/nearby vocabulary.
-    Prevents irrelevant roles (e.g., packer) when searching Receptionist.
+    Hard gate, but SAFE:
+    - If title is missing/Not stated, keep it (so we don't end up with 0 rows).
+    - Otherwise require at least 1 meaningful overlap with target/adjacent/nearby vocab.
     """
     t = _norm(title)
-    if not t or len(t) < 3:
-        return False
+    if not t or t in {"not stated", "unknown"}:
+        return True  # keep; portal likely blocked details
 
     vocab = set(_words(target_role))
     for a in (adjacent_titles or [])[:15]:
@@ -51,19 +52,16 @@ def compute_relevance(row: Dict, target_role: str, adjacent_titles: List[str], n
         if tr_words and all(w in _norm(title) for w in tr_words):
             score += 100
         else:
-            # adjacent strong match
             if any(_norm(a) in _norm(title) for a in (adjacent_titles or [])):
                 score += 85
-            # nearby match
             elif any(w in _norm(title) for w in _words(" ".join(nearby_titles or []))):
                 score += 60
-            # partial match
             elif any(w in _norm(title) for w in _words(target_role)):
                 score += 30
 
     # B) Domain/industry match (max 40) — heuristic
     emp_n = _norm(employer)
-    if any(k in emp_n for k in ["hotel", "clinic", "medical", "dental", "hospital", "office", "service", "property"]):
+    if any(k in emp_n for k in ["government", "agency", "community", "charity", "foundation", "association", "ngo", "service"]):
         score += 40
     elif employer and employer != "Not stated":
         score += 25
