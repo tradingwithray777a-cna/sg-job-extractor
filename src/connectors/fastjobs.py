@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import re
 from typing import List
 from urllib.parse import quote_plus, urljoin
 
@@ -13,11 +12,12 @@ HEADERS = {
     "Accept-Language": "en-SG,en;q=0.9",
 }
 
+
 class FastJobsConnector(BaseConnector):
     source_name = "FastJobs"
 
     def search(self, query: str, limit: int = 80) -> List[RawJob]:
-        q = quote_plus(query.strip())
+        q = quote_plus((query or "").strip())
         url = f"https://www.fastjobs.sg/singapore-jobs-search/{q}/?source=search"
 
         status, final_url, html = self.http_get(url, headers=HEADERS, timeout=30)
@@ -31,9 +31,11 @@ class FastJobsConnector(BaseConnector):
             href = a.get("href") or ""
             if "/singapore-job-ad/" not in href:
                 continue
+
             full = href if href.startswith("http") else urljoin("https://www.fastjobs.sg", href)
             if full not in links:
                 links.append(full)
+
             if len(links) >= limit:
                 break
 
@@ -54,10 +56,5 @@ class FastJobsConnector(BaseConnector):
                     job_type="Not stated",
                 )
             )
-        return jobs
-
-
-            if len(jobs) >= limit:
-                break
 
         return jobs
