@@ -4,7 +4,6 @@ import re
 from typing import List
 from urllib.parse import quote_plus, urljoin
 
-import requests
 from bs4 import BeautifulSoup
 
 from .base import BaseConnector, RawJob
@@ -24,30 +23,25 @@ class MyCareersFutureConnector(BaseConnector):
         q = quote_plus(query.strip())
         url = f"https://www.mycareersfuture.gov.sg/search?search={q}&sortBy=new_posting_date&page=0"
 
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=30)
-            if r.status_code != 200:
-                return []
-        except Exception:
+        status, final_url, html = self.http_get(url, headers=HEADERS, timeout=30)
+        if status != 200 or not html:
             return []
 
-        html = r.text
         soup = BeautifulSoup(html, "html.parser")
 
-        # Collect job links
         links = []
+        # primary: anchors
         for a in soup.find_all("a", href=True):
             href = a.get("href") or ""
-            if not href:
+            if "/job/" not in href:
                 continue
-            if "/job/" in href:
-                full = href if href.startswith("http") else urljoin("https://www.mycareersfuture.gov.sg", href)
-                if full not in links:
-                    links.append(full)
+            full = href if href.startswith("http") else urljoin("https://www.mycareersfuture.gov.sg", href)
+            if full not in links:
+                links.append(full)
             if len(links) >= limit * 2:
                 break
 
-        # Regex fallback if anchors fail
+        # fallback: regex for "/job/..."
         if not links:
             hits = re.findall(r'"/job/[^"\s]+"' , html)
             for h in hits:
@@ -58,28 +52,14 @@ class MyCareersFutureConnector(BaseConnector):
                 if len(links) >= limit * 2:
                     break
 
+        # debug count
+        self._set_debug(found_links=len(links))
+
         jobs: List[RawJob] = []
-
-        # Create minimal jobs (title extraction best-effort)
         for job_url in links[:limit]:
-            title = "Not stated"
-
-            # Try to find anchor node again to extract text
-            rel = job_url.replace("https://www.mycareersfuture.gov.sg", "")
-            a = soup.find("a", href=lambda x: x and rel in x)
-            if a:
-                # Look for h3/h2 around it
-                h = a.find(["h1", "h2", "h3"])
-                if h:
-                    title = _clean(h.get_text(" ", strip=True))[:200]
-                else:
-                    t = _clean(a.get_text(" ", strip=True))
-                    if t:
-                        title = t[:200]
-
             jobs.append(
                 RawJob(
-                    title=title or "Not stated",
+                    title="Not stated",
                     employer="Not stated",
                     url=job_url,
                     source=self.source_name,
@@ -90,12 +70,4 @@ class MyCareersFutureConnector(BaseConnector):
                     job_type="Not stated",
                 )
             )
-
-        # Dedup by URL
-        seen = set()
-        out = []
-        for j in jobs:
-            if j.url and j.url not in seen:
-                out.append(j)
-                seen.add(j.url)
-        return out[:limit]
+        return jobs
