@@ -7,10 +7,10 @@ import re
 
 from src.scoring import compute_relevance, closing_passed, should_keep_title
 
-from src.connectors.mycareersfuture import MyCareersFutureConnector
-from src.connectors.grabjobs import GrabJobsConnector
 from src.connectors.foundit import FounditConnector
 from src.connectors.fastjobs import FastJobsConnector
+from src.connectors.mycareersfuture import MyCareersFutureConnector
+from src.connectors.grabjobs import GrabJobsConnector
 
 try:
     from src.excel_writer import write_excel
@@ -69,7 +69,7 @@ def _fallback_write_excel(jobs: List[Dict], notes: Dict, out_path: str) -> str:
     ws2 = wb.create_sheet("Notes")
     ws2.append(["Item", "Value"])
     ws2.freeze_panes = "A2"
-    ws2.column_dimensions["A"].width = 38
+    ws2.column_dimensions["A"].width = 42
     ws2.column_dimensions["B"].width = 120
     ws2["A1"].font = Font(bold=True)
     ws2["B1"].font = Font(bold=True)
@@ -95,19 +95,30 @@ class KeywordSets:
 
 def build_keyword_sets(target_role: str) -> KeywordSets:
     tr = (target_role or "").strip()
-    tr_n = _norm(tr)
 
-    synonyms = {
-        "receptionist": ["front desk", "front office", "guest services"],
-        "procurement": ["sourcing", "purchasing", "buyer"],
-        "community": ["engagement", "outreach"],
-        "partnership": ["stakeholder", "partnerships"],
-    }
-
-    words = [w for w in tr_n.split(" ") if w]
+    # Generic keyword sets (works for any role)
     core = [tr]
-    for w in words:
-        core.extend(synonyms.get(w, []))
+    adjacent = [
+        f"{tr} Executive", f"{tr} Officer", f"{tr} Specialist",
+        f"Senior {tr}", f"Assistant {tr}", f"{tr} Coordinator",
+        f"{tr} Manager"
+    ]
+    nearby = ["Programme Executive", "Stakeholder Management", "Partnerships Executive", "Community Engagement"]
+    exclude = []
+
+    # small custom hints for common words
+    trn = _norm(tr)
+    if "community" in trn and "partnership" in trn:
+        adjacent = [
+            "Community Partnerships Executive", "Partnerships Executive", "Community Engagement Executive",
+            "Stakeholder Management Executive", "Community Outreach Executive", "Partnership Officer",
+            "Strategic Partnerships Executive", "Partnership Development Executive",
+        ]
+        nearby = [
+            "Programme Executive", "Programme Coordinator", "Corporate Relations Executive",
+            "Business Development Executive", "CSR Executive", "Events Executive",
+            "Stakeholder Engagement Officer",
+        ]
 
     def dedupe(lst: List[str], cap: int) -> List[str]:
         out, seen = [], set()
@@ -120,25 +131,9 @@ def build_keyword_sets(target_role: str) -> KeywordSets:
                 break
         return out
 
-    core_keywords = dedupe(core, 10)
-
-    adjacent, nearby, exclude = [], [], []
-
-    if "receptionist" in tr_n:
-        adjacent = [
-            "Front Desk Officer", "Front Office Executive", "Reception Executive",
-            "Clinic Receptionist", "Hotel Receptionist", "Guest Service Officer",
-            "Administrative Receptionist", "Office Receptionist",
-        ]
-        nearby = [
-            "Administrative Assistant", "Office Administrator", "Customer Service Officer",
-            "Guest Relations Officer", "Facilities Coordinator",
-        ]
-        exclude = ["packer", "warehouse", "sorter", "assembler"]
-
     return KeywordSets(
         target_role=tr,
-        core_keywords=core_keywords,
+        core_keywords=dedupe(core, 10),
         adjacent_titles=dedupe(adjacent, 20),
         nearby_titles=dedupe(nearby, 20),
         exclude_keywords=dedupe(exclude, 10),
@@ -146,10 +141,10 @@ def build_keyword_sets(target_role: str) -> KeywordSets:
 
 
 CONNECTORS = {
-    "MyCareersFuture": MyCareersFutureConnector(),
-    "GrabJobs": GrabJobsConnector(),
     "Foundit": FounditConnector(),
     "FastJobs": FastJobsConnector(),
+    "MyCareersFuture": MyCareersFutureConnector(),
+    "GrabJobs": GrabJobsConnector(),
 }
 
 
@@ -157,7 +152,7 @@ def build_queries(target_role: str, adjacent_titles: List[str], core_keywords: L
     queries = [(target_role, "Exact")]
     for t in (adjacent_titles or [])[:3]:
         queries.append((t, "Adjacent"))
-
+    # simple skill-based: target + 2 core terms if any
     cores = [c for c in (core_keywords or []) if _norm(c) != _norm(target_role)]
     if len(cores) >= 2:
         queries.append((f"{target_role} {cores[0]} {cores[1]}", "Skill-based"))
@@ -178,28 +173,31 @@ def run_search(
     queries = build_queries(target_role, ks.adjacent_titles, ks.core_keywords)
 
     raw_rows: List[Dict] = []
-    portal_raw_counts: Dict[str, int] = {}
+    portal_stats: Dict[str, Dict[str, int]] = {}
+    dropped_gate = 0
 
     for portal in selected_portals:
         conn = CONNECTORS.get(portal)
         if not conn:
-            portal_raw_counts[portal] = 0
+            portal_stats[portal] = {"returned": 0, "kept": 0}
             continue
 
-        portal_hits = 0
-        for q, _qt in queries:
+        returned_total = 0
+        kept_total = 0
+
+        for q, qtype in queries:
             try:
                 jobs = conn.search(q, limit=80)
             except Exception:
                 jobs = []
 
-            portal_hits += len(jobs)
+            returned_total += len(jobs)
 
             for j in jobs:
                 title = getattr(j, "title", "") or "Not stated"
 
-                # HARD GATE: drop irrelevant titles
                 if not should_keep_title(title, ks.target_role, ks.adjacent_titles, ks.nearby_titles):
+                    dropped_gate += 1
                     continue
 
                 raw_rows.append({
@@ -213,25 +211,25 @@ def run_search(
                     "estimated salary": getattr(j, "salary", "") or "Not stated",
                     "job full-time or part-time": getattr(j, "job_type", "") or "Not stated",
                 })
+                kept_total += 1
+
                 if len(raw_rows) >= raw_cap:
                     break
+
             if len(raw_rows) >= raw_cap:
                 break
 
-        portal_raw_counts[portal] = portal_hits
+        portal_stats[portal] = {"returned": returned_total, "kept": kept_total}
         if len(raw_rows) >= raw_cap:
             break
 
-    raw_count = len(raw_rows)
-
-    # Deduplicate
+    # Dedup
     def key(r): return (_norm(r["Job title available"]), _norm(r["employer"]))
     best = {}
     for r in raw_rows:
         k = key(r)
         if k not in best:
             best[k] = r
-
     deduped = list(best.values())
 
     today = datetime.now().date()
@@ -239,15 +237,24 @@ def run_search(
         r["Relevance score"] = compute_relevance(r, ks.target_role, ks.adjacent_titles, ks.nearby_titles)
         r["Closing date passed? (Y/N)"] = closing_passed(r.get("application closing date", "Not stated"), today=today)
 
-    deduped.sort(key=lambda r: (-int(r.get("Relevance score", 0)), r.get("date job post was posted") == "Unverified"))
+    # Sort: score desc, verified posted first
+    def sort_key(r):
+        ver = 0 if r.get("date job post was posted") == "Unverified" else 1
+        return (-int(r.get("Relevance score", 0)), -ver)
+
+    deduped.sort(key=sort_key)
     final = deduped[:max_final]
 
+    # Notes debug
     notes = {
         "Search date/time (SG time)": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "TARGET_ROLE": ks.target_role,
-        "Portals searched (raw hits)": "; ".join([f"{p}: {portal_raw_counts.get(p,0)}" for p in selected_portals]),
-        "Counts (raw → after dedupe → final)": f"{raw_count} → {len(deduped)} → {len(final)}",
-        "Hard title gate": "Only keep jobs where title overlaps target/adjacent/nearby keywords (prevents irrelevant roles).",
+        "Queries used": "; ".join([f"{qt}:{q}" for q, qt in queries]),
+        "Portals selected": ", ".join(selected_portals),
+        "Portal stats (returned vs kept)": "; ".join([f"{p}: {portal_stats[p]['returned']} returned, {portal_stats[p]['kept']} kept" for p in portal_stats]),
+        "Dropped by title gate": str(dropped_gate),
+        "Counts (raw kept → dedupe → final)": f"{len(raw_rows)} → {len(deduped)} → {len(final)}",
+        "Why Excel can be empty": "If portals return 0 links (blocked/JS-rendered), or titles are missing and were filtered previously. This build keeps 'Not stated' titles to avoid 0 rows.",
     }
 
     if write_excel:
