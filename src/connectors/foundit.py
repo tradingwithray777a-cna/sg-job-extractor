@@ -2,9 +2,7 @@ from __future__ import annotations
 
 import re
 from typing import List
-from urllib.parse import quote_plus, urljoin
-
-from bs4 import BeautifulSoup
+from urllib.parse import quote_plus
 
 from .base import BaseConnector, RawJob
 
@@ -17,32 +15,31 @@ class FounditConnector(BaseConnector):
     source_name = "Foundit"
 
     def search(self, query: str, limit: int = 80) -> List[RawJob]:
-        q = quote_plus(query.strip())
+        q = quote_plus((query or "").strip())
         url = f"https://www.foundit.sg/srp/results?query={q}&locations=Singapore"
 
         status, final_url, html = self.http_get(url, headers=HEADERS, timeout=30)
         if status != 200 or not html:
             return []
 
-        soup = BeautifulSoup(html, "html.parser")
+        html2 = html.replace("\\/", "/")
 
         links = []
-        for a in soup.select("a[href*='/job/']"):
-            href = a.get("href") or ""
-            if not href:
-                continue
-            full = href if href.startswith("http") else urljoin("https://www.foundit.sg", href)
-            if full not in links:
-                links.append(full)
+        # match full URLs
+        for m in re.findall(r"https?://www\.foundit\.sg/job/[^\"'\s<>]+", html2):
+            if m not in links:
+                links.append(m)
             if len(links) >= limit:
                 break
 
-        # fallback regex
+        # fallback: relative job paths
         if not links:
-            hits = re.findall(r'https://www\.foundit\.sg/job/[^"\'\s<]+', html)
-            for h in hits[:limit]:
-                if h not in links:
-                    links.append(h)
+            for p in re.findall(r"/job/[^\"'\s<>]+", html2):
+                full = "https://www.foundit.sg" + p
+                if full not in links:
+                    links.append(full)
+                if len(links) >= limit:
+                    break
 
         self._set_debug(found_links=len(links))
 
